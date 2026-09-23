@@ -260,7 +260,7 @@ def main():
             except Exception as error:
                 print(f"Не удалось отправить сигнал {base} в Telegram: {error}")
         except Exception as error:
-            print(f"Пропуск {base}: {error}")
+            print(f"Пропуск {contract[0]}: {error}")
 
     STATE_FILE.write_text(
         json.dumps(current_signals, ensure_ascii=False, indent=2),
