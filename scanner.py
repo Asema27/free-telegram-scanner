@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone
+from itertools import combinations
 
 import ccxt
 import requests
@@ -12,9 +13,19 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "scanner-state.json"))
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "AUTO")
 
+# Binance can be blocked from some GitHub runner locations. The scanner
+# continues with whichever public futures exchanges are reachable.
 EXCHANGES = {
     "Binance": ccxt.binanceusdm({"enableRateLimit": True}),
     "Bybit": ccxt.bybit({
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},
+    }),
+    "OKX": ccxt.okx({
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},
+    }),
+    "Bitget": ccxt.bitget({
         "enableRateLimit": True,
         "options": {"defaultType": "swap"},
     }),
@@ -50,54 +61,66 @@ def telegram_send(message):
         raise RuntimeError(f"Telegram вернул ошибку: {result}")
 
 
-def load_common_markets():
-    market_sets = {}
+def load_markets():
+    available = {}
     for name, exchange in EXCHANGES.items():
-        markets = exchange.load_markets()
-        market_sets[name] = {
-            symbol: market
-            for symbol, market in markets.items()
-            if market.get("active")
-            and market.get("swap")
-            and market.get("linear")
-            and market.get("quote") == "USDT"
-            and market.get("settle") == "USDT"
-        }
-        print(f"{name}: {len(market_sets[name])} активных USDT-перпетуалов")
-
-    bybit_by_contract = {}
-    for symbol, market in market_sets["Bybit"].items():
-        key = (market.get("baseId"), market.get("quoteId"), market.get("contractSize"))
-        bybit_by_contract[key] = symbol
-
-    pairs = []
-    for binance_symbol, market in market_sets["Binance"].items():
-        key = (market.get("baseId"), market.get("quoteId"), market.get("contractSize"))
-        bybit_symbol = bybit_by_contract.get(key)
-        if bybit_symbol:
-            pairs.append((market.get("base"), binance_symbol, bybit_symbol))
-    return pairs
+        try:
+            markets = exchange.load_markets()
+            by_base = {}
+            for symbol, market in markets.items():
+                if (
+                    market.get("active")
+                    and market.get("swap")
+                    and market.get("linear")
+                    and market.get("quote") == "USDT"
+                    and market.get("settle") == "USDT"
+                ):
+                    by_base[market.get("base")] = symbol
+            if by_base:
+                available[name] = by_base
+                print(f"{name}: {len(by_base)} активных USDT-перпетуалов")
+            else:
+                print(f"{name}: подходящие контракты не найдены")
+        except Exception as error:
+            print(f"{name}: недоступна, пропускаю ({error})")
+    return available
 
 
-def ticker_candidate(base, binance_symbol, bybit_symbol, tickers):
+def fetch_quotes(available):
     quotes = {}
-    for name, symbol in (("Binance", binance_symbol), ("Bybit", bybit_symbol)):
-        ticker = tickers[name].get(symbol, {})
-        bid, ask = ticker.get("bid"), ticker.get("ask")
-        if not bid or not ask or bid <= 0 or ask <= 0:
-            return None
-        quotes[name] = {"symbol": symbol, "bid": bid, "ask": ask}
+    for name, exchange in EXCHANGES.items():
+        if name not in available:
+            continue
+        try:
+            tickers = exchange.fetch_tickers()
+            quotes[name] = {}
+            for base, symbol in available[name].items():
+                ticker = tickers.get(symbol, {})
+                bid, ask = ticker.get("bid"), ticker.get("ask")
+                if bid and ask and bid > 0 and ask > 0:
+                    quotes[name][base] = {
+                        "symbol": symbol,
+                        "bid": bid,
+                        "ask": ask,
+                    }
+        except Exception as error:
+            print(f"{name}: не удалось получить котировки, пропускаю ({error})")
+    return quotes
 
-    options = []
-    for buy_name, sell_name in (("Binance", "Bybit"), ("Bybit", "Binance")):
-        buy, sell = quotes[buy_name], quotes[sell_name]
-        gross = (sell["bid"] / buy["ask"] - 1) * 100
-        options.append((gross, buy_name, sell_name, buy, sell))
 
-    gross, buy_name, sell_name, buy, sell = max(options, key=lambda row: row[0])
-    if gross < MIN_SPREAD_PERCENT:
+def find_candidate(base, venues):
+    choices = []
+    for buy_name, sell_name in combinations(venues, 2):
+        for buyer, seller in ((buy_name, sell_name), (sell_name, buy_name)):
+            buy = venues[buyer]
+            sell = venues[seller]
+            gross = (sell["bid"] / buy["ask"] - 1) * 100
+            if gross >= MIN_SPREAD_PERCENT:
+                choices.append((gross, buyer, seller, buy, sell))
+
+    if not choices:
         return None
-
+    gross, buy_name, sell_name, buy, sell = max(choices, key=lambda row: row[0])
     return {
         "base": base,
         "buy_exchange": buy_name,
@@ -142,29 +165,40 @@ def read_state():
 
 
 def main():
-    pairs = load_common_markets()
-    print(f"Совпадающих контрактов: {len(pairs)}")
+    available = load_markets()
+    if len(available) < 2:
+        raise RuntimeError(
+            "Доступно меньше двух бирж. Проверьте журнал запуска GitHub Actions."
+        )
 
-    tickers = {
-        name: exchange.fetch_tickers()
-        for name, exchange in EXCHANGES.items()
-    }
-
+    common_bases = set.intersection(*(set(markets) for markets in available.values()))
+    print(f"Общих монет минимум на двух биржах: {len(common_bases)}")
+    quotes = fetch_quotes(available)
     previous_signals = read_state()
     current_signals = {}
     new_count = 0
+    candidate_count = 0
 
-    for base, binance_symbol, bybit_symbol in pairs:
+    for base in sorted(common_bases):
+        venues = {
+            name: exchange_quotes[base]
+            for name, exchange_quotes in quotes.items()
+            if base in exchange_quotes
+        }
+        if len(venues) < 2:
+            continue
+
         try:
-            signal = ticker_candidate(
-                base, binance_symbol, bybit_symbol, tickers
-            )
-            if not signal or not confirm_with_order_books(signal):
+            signal = find_candidate(base, venues)
+            if not signal:
+                continue
+            if not confirm_with_order_books(signal):
                 continue
 
+            candidate_count += 1
             key = f"{base}:{signal['buy_exchange']}:{signal['sell_exchange']}"
-            current_signals[key] = round(signal["gross"], 4)
             if key in previous_signals:
+                current_signals[key] = round(signal["gross"], 4)
                 continue
 
             message = (
@@ -178,9 +212,13 @@ def main():
                 f"Время UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"Проверьте комиссии, funding, стакан и доступность контрактов вручную."
             )
-            telegram_send(message)
-            new_count += 1
-            print(f"Отправлен сигнал: {base}, {signal['gross']:.2f}%")
+            try:
+                telegram_send(message)
+                current_signals[key] = round(signal["gross"], 4)
+                new_count += 1
+                print(f"Отправлен сигнал: {base}, {signal['gross']:.2f}%")
+            except Exception as error:
+                print(f"Не удалось отправить сигнал {base} в Telegram: {error}")
         except Exception as error:
             print(f"Пропуск {base}: {error}")
 
@@ -189,8 +227,8 @@ def main():
         encoding="utf-8",
     )
     print(
-        f"Готово. Кандидатов от {MIN_SPREAD_PERCENT}%: {len(current_signals)}; "
-        f"новых уведомлений: {new_count}."
+        f"Готово. Подтверждённых кандидатов от {MIN_SPREAD_PERCENT}%: "
+        f"{candidate_count}; новых уведомлений: {new_count}."
     )
 
 
