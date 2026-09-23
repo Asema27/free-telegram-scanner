@@ -8,6 +8,7 @@ import ccxt
 import requests
 
 MIN_SPREAD_PERCENT = 3.0
+MIN_24H_QUOTE_VOLUME = 100_000
 ORDER_BOOK_LIMIT = 5
 STATE_FILE = Path(os.environ.get("STATE_FILE", "scanner-state.json"))
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -66,19 +67,27 @@ def load_markets():
     for name, exchange in EXCHANGES.items():
         try:
             markets = exchange.load_markets()
-            by_base = {}
+            by_contract = {}
             for symbol, market in markets.items():
+                base_id = market.get("baseId")
+                quote_id = market.get("quoteId") or market.get("quote")
                 if (
                     market.get("active")
                     and market.get("swap")
                     and market.get("linear")
                     and market.get("quote") == "USDT"
                     and market.get("settle") == "USDT"
+                    and base_id
+                    and quote_id == "USDT"
                 ):
-                    by_base[market.get("base")] = symbol
-            if by_base:
-                available[name] = by_base
-                print(f"{name}: {len(by_base)} активных USDT-перпетуалов")
+                    key = (base_id, quote_id, market.get("settle"))
+                    by_contract[key] = {
+                        "base": market.get("base"),
+                        "symbol": symbol,
+                    }
+            if by_contract:
+                available[name] = by_contract
+                print(f"{name}: {len(by_contract)} активных USDT-перпетуалов")
             else:
                 print(f"{name}: подходящие контракты не найдены")
         except Exception as error:
@@ -94,21 +103,28 @@ def fetch_quotes(available):
         try:
             tickers = exchange.fetch_tickers()
             quotes[name] = {}
-            for base, symbol in available[name].items():
-                ticker = tickers.get(symbol, {})
+            for contract, market in available[name].items():
+                ticker = tickers.get(market["symbol"], {})
                 bid, ask = ticker.get("bid"), ticker.get("ask")
-                if bid and ask and bid > 0 and ask > 0:
-                    quotes[name][base] = {
-                        "symbol": symbol,
+                quote_volume = ticker.get("quoteVolume")
+                if (
+                    bid and ask and bid > 0 and ask > 0
+                    and quote_volume and quote_volume >= MIN_24H_QUOTE_VOLUME
+                ):
+                    quotes[name][contract] = {
+                        "base": market["base"],
+                        "symbol": market["symbol"],
                         "bid": bid,
                         "ask": ask,
+                        "quote_volume": quote_volume,
                     }
+            print(f"{name}: котировки с оборотом ≥ {MIN_24H_QUOTE_VOLUME:,} USDT: {len(quotes[name])}")
         except Exception as error:
             print(f"{name}: не удалось получить котировки, пропускаю ({error})")
     return quotes
 
 
-def find_candidate(base, venues):
+def find_candidate(venues):
     choices = []
     for buy_name, sell_name in combinations(venues, 2):
         for buyer, seller in ((buy_name, sell_name), (sell_name, buy_name)):
@@ -122,7 +138,7 @@ def find_candidate(base, venues):
         return None
     gross, buy_name, sell_name, buy, sell = max(choices, key=lambda row: row[0])
     return {
-        "base": base,
+        "base": next(iter(venues.values()))["base"],
         "buy_exchange": buy_name,
         "sell_exchange": sell_name,
         "buy_symbol": buy["symbol"],
@@ -171,27 +187,28 @@ def main():
             "Доступно меньше двух бирж. Проверьте журнал запуска GitHub Actions."
         )
 
-    common_bases = set.intersection(*(set(markets) for markets in available.values()))
-    print(f"Общих монет минимум на двух биржах: {len(common_bases)}")
+    all_contracts = set.union(*(set(markets) for markets in available.values()))
+    print(f"Контрактов для проверки: {len(all_contracts)}")
     quotes = fetch_quotes(available)
     previous_signals = read_state()
     current_signals = {}
     new_count = 0
     candidate_count = 0
 
-    for base in sorted(common_bases):
+    for contract in sorted(all_contracts):
         venues = {
-            name: exchange_quotes[base]
+            name: exchange_quotes[contract]
             for name, exchange_quotes in quotes.items()
-            if base in exchange_quotes
+            if contract in exchange_quotes
         }
         if len(venues) < 2:
             continue
 
         try:
-            signal = find_candidate(base, venues)
+            signal = find_candidate(venues)
             if not signal:
                 continue
+            base = signal["base"]
             if not confirm_with_order_books(signal):
                 continue
 
