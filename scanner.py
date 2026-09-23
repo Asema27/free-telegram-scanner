@@ -8,7 +8,9 @@ import ccxt
 import requests
 
 MIN_SPREAD_PERCENT = 3.0
+MAX_SPREAD_PERCENT = 20.0
 MIN_24H_QUOTE_VOLUME = 100_000
+MIN_TOP_LEVEL_NOTIONAL_USDT = 1_000
 ORDER_BOOK_LIMIT = 5
 STATE_FILE = Path(os.environ.get("STATE_FILE", "scanner-state.json"))
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -135,7 +137,7 @@ def find_candidate(venues):
             buy = venues[buyer]
             sell = venues[seller]
             gross = (sell["bid"] / buy["ask"] - 1) * 100
-            if gross >= MIN_SPREAD_PERCENT:
+            if MIN_SPREAD_PERCENT <= gross <= MAX_SPREAD_PERCENT:
                 choices.append((gross, buyer, seller, buy, sell))
 
     if not choices:
@@ -164,7 +166,11 @@ def confirm_with_order_books(signal):
     buy_ask, buy_size = buy_book["asks"][0][0], buy_book["asks"][0][1]
     sell_bid, sell_size = sell_book["bids"][0][0], sell_book["bids"][0][1]
     spread = (sell_bid / buy_ask - 1) * 100
-    if spread < MIN_SPREAD_PERCENT:
+    if not MIN_SPREAD_PERCENT <= spread <= MAX_SPREAD_PERCENT:
+        return False
+    if buy_ask * buy_size < MIN_TOP_LEVEL_NOTIONAL_USDT:
+        return False
+    if sell_bid * sell_size < MIN_TOP_LEVEL_NOTIONAL_USDT:
         return False
 
     signal.update({
@@ -248,7 +254,7 @@ def main():
         encoding="utf-8",
     )
     print(
-        f"Готово. Подтверждённых кандидатов от {MIN_SPREAD_PERCENT}%: "
+        f"Готово. Подтверждённых кандидатов от {MIN_SPREAD_PERCENT}% до {MAX_SPREAD_PERCENT}%: "
         f"{candidate_count}; новых уведомлений: {new_count}."
     )
 
