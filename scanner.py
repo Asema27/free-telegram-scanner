@@ -202,6 +202,19 @@ def main():
     quotes = fetch_quotes(available)
     previous_signals = read_state()
     current_signals = {}
+    correction_key = "_scanner_correction_20260923"
+    if previous_signals.get(correction_key):
+        current_signals[correction_key] = True
+    else:
+        try:
+            telegram_send(
+                "⚠️ Внимание: предыдущие сигналы с расхождением выше 20% были аномальными. "
+                "Не используйте их для сделок. Фильтры сканера обновлены."
+            )
+            current_signals[correction_key] = True
+            print("Отправлено предупреждение об аномальных предыдущих сигналах")
+        except Exception as error:
+            print(f"Не удалось отправить предупреждение в Telegram: {error}")
     new_count = 0
     candidate_count = 0
 
