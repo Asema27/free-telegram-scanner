@@ -141,8 +141,8 @@ def confirm_with_order_books(signal):
     if not buy_book["asks"] or not sell_book["bids"]:
         return False
 
-    buy_ask, buy_size = buy_book["asks"][0]
-    sell_bid, sell_size = sell_book["bids"][0]
+    buy_ask, buy_size = buy_book["asks"][0][0], buy_book["asks"][0][1]
+    sell_bid, sell_size = sell_book["bids"][0][0], sell_book["bids"][0][1]
     spread = (sell_bid / buy_ask - 1) * 100
     if spread < MIN_SPREAD_PERCENT:
         return False
