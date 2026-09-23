@@ -107,6 +107,10 @@ def fetch_quotes(available):
                 ticker = tickers.get(market["symbol"], {})
                 bid, ask = ticker.get("bid"), ticker.get("ask")
                 quote_volume = ticker.get("quoteVolume")
+                if not quote_volume:
+                    base_volume, last = ticker.get("baseVolume"), ticker.get("last")
+                    if base_volume and last and base_volume > 0 and last > 0:
+                        quote_volume = base_volume * last
                 if (
                     bid and ask and bid > 0 and ask > 0
                     and quote_volume and quote_volume >= MIN_24H_QUOTE_VOLUME
